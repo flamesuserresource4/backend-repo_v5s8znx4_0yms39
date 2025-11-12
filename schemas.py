@@ -68,6 +68,18 @@ class InventoryItem(BaseModel):
     supplier: Optional[str] = None
     last_updated: Optional[datetime] = None
 
+class InventoryMovement(BaseModel):
+    type: str = Field(..., description="in | out")
+    ingredient_id: str
+    lot_code: str
+    qty_kg: float = Field(..., gt=0)
+    movement_date: datetime = Field(default_factory=datetime.utcnow)
+    reason: Optional[str] = Field(None, description="e.g., purchase, production, waste, correction")
+    expiry_date: Optional[datetime] = None
+    cost_per_kg: Optional[float] = Field(None, ge=0)
+    supplier: Optional[str] = None
+    note: Optional[str] = None
+
 class Customer(BaseModel):
     business_name: str
     contact_name: Optional[str] = None

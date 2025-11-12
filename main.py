@@ -4,6 +4,7 @@ from typing import List, Optional, Dict
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from bson import ObjectId
 
@@ -18,6 +19,7 @@ from schemas import (
     Customer,
     Tutorial,
     Notification,
+    InventoryMovement,
 )
 
 app = FastAPI(title="Gelato Pro Suite API")
@@ -252,7 +254,292 @@ def list_orders(limit: Optional[int] = 200):
             d["id"] = str(d.pop("_id"))
     return docs
 
-# Inventory expiry notifications (MVP)
+# Inventory advanced module
+
+def _notify_expiring(item: dict, days_threshold: int = 7):
+    try:
+        expiry = item.get("expiry_date")
+        if not expiry:
+            return
+        now = datetime.utcnow()
+        if isinstance(expiry, str):
+            try:
+                expiry = datetime.fromisoformat(expiry)
+            except Exception:
+                return
+        if expiry <= now + timedelta(days=days_threshold):
+            message = f"Lotto {item.get('lot_code','')} di ingrediente {item.get('ingredient_id')} in scadenza il {expiry.date().isoformat()}"
+            notif = Notification(type="expiry", message=message, date=now, read=False)
+            create_document("notification", notif)
+    except Exception:
+        pass
+
+class CreateMovementRequest(InventoryMovement):
+    pass
+
+@app.post("/api/inventory/movements")
+def create_movement(payload: CreateMovementRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+
+    data = payload.model_dump()
+    mtype = data.get("type")
+    if mtype not in ("in", "out"):
+        raise HTTPException(status_code=400, detail="Movement type must be 'in' or 'out'")
+
+    # Save movement history
+    mid = create_document("inventorymovement", data)
+
+    # Update or create inventory item per ingredient+lot
+    lot_filter = {"ingredient_id": data["ingredient_id"], "lot_code": data["lot_code"]}
+    item = db["inventoryitem"].find_one(lot_filter)
+
+    if mtype == "in":
+        if item:
+            new_qty = float(item.get("qty_kg", 0)) + float(data["qty_kg"])
+            update = {
+                "$set": {
+                    "qty_kg": new_qty,
+                    "expiry_date": data.get("expiry_date") or item.get("expiry_date"),
+                    "cost_per_kg": data.get("cost_per_kg", item.get("cost_per_kg")),
+                    "supplier": data.get("supplier", item.get("supplier")),
+                    "last_updated": datetime.utcnow(),
+                }
+            }
+            db["inventoryitem"].update_one(lot_filter, update)
+        else:
+            inv = InventoryItem(
+                ingredient_id=data["ingredient_id"],
+                lot_code=data["lot_code"],
+                qty_kg=float(data["qty_kg"]),
+                expiry_date=data.get("expiry_date"),
+                cost_per_kg=data.get("cost_per_kg"),
+                supplier=data.get("supplier"),
+                last_updated=datetime.utcnow(),
+            )
+            create_document("inventoryitem", inv)
+    else:  # out
+        if not item:
+            raise HTTPException(status_code=404, detail="Inventory lot not found")
+        current = float(item.get("qty_kg", 0))
+        qty = float(data["qty_kg"])
+        if qty > current:
+            raise HTTPException(status_code=400, detail="Not enough stock for this lot")
+        new_qty = current - qty
+        update = {"$set": {"qty_kg": new_qty, "last_updated": datetime.utcnow()}}
+        db["inventoryitem"].update_one(lot_filter, update)
+
+    # Create notification if expiring soon
+    it = db["inventoryitem"].find_one(lot_filter)
+    if it:
+        _notify_expiring(it)
+
+    return {"movement_id": mid}
+
+@app.get("/api/inventory/items")
+def list_inventory_items(limit: Optional[int] = 500):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    items = get_documents("inventoryitem", {}, limit or 500)
+    now = datetime.utcnow()
+    result = []
+    for it in items:
+        it_id = str(it.pop("_id", ""))
+        expiry = it.get("expiry_date")
+        days_to_expiry = None
+        status = "ok"
+        if expiry:
+            if isinstance(expiry, str):
+                try:
+                    expiry = datetime.fromisoformat(expiry)
+                except Exception:
+                    expiry = None
+            if expiry:
+                delta = (expiry - now).days
+                days_to_expiry = delta
+                if delta < 0:
+                    status = "expired"
+                elif delta <= 7:
+                    status = "soon"
+        # fetch ingredient name
+        ing = db["ingredient"].find_one({"_id": to_object_id(it.get("ingredient_id"))}) if it.get("ingredient_id") else None
+        result.append({
+            "id": it_id,
+            "ingredient_id": it.get("ingredient_id"),
+            "ingredient_name": ing.get("name") if ing else None,
+            "lot_code": it.get("lot_code"),
+            "qty_kg": round(float(it.get("qty_kg", 0)), 3),
+            "expiry_date": expiry.isoformat() if isinstance(expiry, datetime) else (it.get("expiry_date") if it.get("expiry_date") else None),
+            "days_to_expiry": days_to_expiry,
+            "status": status,
+            "cost_per_kg": it.get("cost_per_kg"),
+            "supplier": it.get("supplier"),
+        })
+    return result
+
+@app.get("/api/inventory/report")
+def inventory_report(start_date: Optional[str] = None, end_date: Optional[str] = None):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    try:
+        start = datetime.fromisoformat(start_date) if start_date else datetime.utcnow() - timedelta(days=30)
+        end = datetime.fromisoformat(end_date) if end_date else datetime.utcnow()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use ISO format.")
+
+    # Aggregate movements
+    q = {"movement_date": {"$gte": start, "$lte": end}}
+    moves = list(db["inventorymovement"].find(q))
+
+    summary: Dict[str, Dict[str, float]] = {}
+    for m in moves:
+        ing_id = m.get("ingredient_id")
+        if ing_id not in summary:
+            summary[ing_id] = {"in_qty": 0.0, "out_qty": 0.0}
+        if m.get("type") == "in":
+            summary[ing_id]["in_qty"] += float(m.get("qty_kg", 0))
+        else:
+            summary[ing_id]["out_qty"] += float(m.get("qty_kg", 0))
+
+    # Current stock per ingredient
+    items = list(db["inventoryitem"].find({}))
+    stock: Dict[str, float] = {}
+    for it in items:
+        ing_id = it.get("ingredient_id")
+        stock[ing_id] = stock.get(ing_id, 0.0) + float(it.get("qty_kg", 0))
+
+    report = []
+    for ing_id, sums in summary.items():
+        ing = db["ingredient"].find_one({"_id": to_object_id(ing_id)})
+        report.append({
+            "ingredient_id": ing_id,
+            "ingredient_name": ing.get("name") if ing else None,
+            "in_qty": round(sums.get("in_qty", 0.0), 3),
+            "out_qty": round(sums.get("out_qty", 0.0), 3),
+            "net_change": round(sums.get("in_qty", 0.0) - sums.get("out_qty", 0.0), 3),
+            "current_stock": round(stock.get(ing_id, 0.0), 3),
+        })
+
+    return {"period": {"start": start.isoformat(), "end": end.isoformat()}, "data": report}
+
+# Inventory exports
+@app.get("/api/export/inventory.csv")
+def export_inventory_csv():
+    if db is None:
+        return Response(content="id,ingredient,ingredient_id,lot_code,qty_kg,expiry_date,days_to_expiry,cost_per_kg,supplier\n", media_type="text/csv")
+    items = list(db["inventoryitem"].find({}))
+    now = datetime.utcnow()
+    lines = ["id,ingredient,ingredient_id,lot_code,qty_kg,expiry_date,days_to_expiry,cost_per_kg,supplier"]
+    for it in items:
+        iid = str(it.get("_id", ""))
+        ing = db["ingredient"].find_one({"_id": to_object_id(it.get("ingredient_id"))}) if it.get("ingredient_id") else None
+        expiry = it.get("expiry_date")
+        if isinstance(expiry, datetime):
+            expiry_str = expiry.date().isoformat()
+            days = (expiry - now).days
+        else:
+            expiry_str = str(expiry) if expiry else ""
+            try:
+                dt = datetime.fromisoformat(expiry) if expiry else None
+                days = (dt - now).days if dt else ""
+            except Exception:
+                days = ""
+        line = f"{iid},{(ing.get('name') if ing else '')},{it.get('ingredient_id','')},{it.get('lot_code','')},{round(float(it.get('qty_kg',0)),3)},{expiry_str},{days},{it.get('cost_per_kg','')},{(it.get('supplier','') or '')}"
+        lines.append(line)
+    csv = "\n".join(lines)
+    return Response(content=csv, media_type="text/csv")
+
+@app.get("/api/export/movements.csv")
+def export_movements_csv():
+    if db is None:
+        return Response(content="id,type,ingredient_id,lot_code,qty_kg,movement_date,reason,expiry_date,cost_per_kg,supplier,note\n", media_type="text/csv")
+    moves = list(db["inventorymovement"].find({}))
+    lines = ["id,type,ingredient_id,lot_code,qty_kg,movement_date,reason,expiry_date,cost_per_kg,supplier,note"]
+    for m in moves:
+        mid = str(m.get("_id", ""))
+        mvdate = m.get("movement_date")
+        if isinstance(mvdate, datetime):
+            mvdate = mvdate.isoformat()
+        exp = m.get("expiry_date")
+        if isinstance(exp, datetime):
+            exp = exp.date().isoformat()
+        line = f"{mid},{m.get('type','')},{m.get('ingredient_id','')},{m.get('lot_code','')},{round(float(m.get('qty_kg',0)),3)},{mvdate},{m.get('reason','')},{exp},{m.get('cost_per_kg','')},{(m.get('supplier','') or '')},{(m.get('note','') or '').replace(',', ' ')}"
+        lines.append(line)
+    csv = "\n".join(lines)
+    return Response(content=csv, media_type="text/csv")
+
+@app.get("/api/export/inventory.pdf")
+def export_inventory_pdf():
+    # Generate a simple PDF snapshot of current inventory
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from io import BytesIO
+
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, height - 40, "Report Inventario Ingredienti")
+    c.setFont("Helvetica", 10)
+    c.drawString(40, height - 60, datetime.utcnow().strftime("Generato il %Y-%m-%d %H:%M UTC"))
+
+    y = height - 90
+    c.setFont("Helvetica-Bold", 10)
+    headers = ["Ingrediente", "Lotto", "Qta (kg)", "Scadenza", "Stato"]
+    x_positions = [40, 220, 360, 430, 510]
+    for x, h in zip(x_positions, headers):
+        c.drawString(x, y, h)
+    y -= 16
+    c.setFont("Helvetica", 10)
+
+    items = list(db["inventoryitem"].find({}))
+    now = datetime.utcnow()
+    total_kg = 0.0
+    for it in items:
+        if y < 60:
+            c.showPage()
+            y = height - 60
+        ing = db["ingredient"].find_one({"_id": to_object_id(it.get("ingredient_id"))}) if it.get("ingredient_id") else None
+        name = ing.get("name") if ing else ""
+        lot = it.get("lot_code", "")
+        qty = round(float(it.get("qty_kg", 0.0)), 3)
+        total_kg += qty
+        expiry = it.get("expiry_date")
+        status = ""
+        if isinstance(expiry, datetime):
+            days = (expiry - now).days
+            expiry_str = expiry.date().isoformat()
+        else:
+            try:
+                dt = datetime.fromisoformat(expiry) if expiry else None
+                days = (dt - now).days if dt else None
+                expiry_str = dt.date().isoformat() if dt else ""
+            except Exception:
+                days = None
+                expiry_str = str(expiry) if expiry else ""
+        if days is not None:
+            status = "expired" if days < 0 else ("soon" if days <= 7 else "ok")
+        c.drawString(x_positions[0], y, str(name)[:26])
+        c.drawString(x_positions[1], y, str(lot)[:12])
+        c.drawRightString(x_positions[2]+30, y, f"{qty}")
+        c.drawString(x_positions[3], y, expiry_str)
+        c.drawString(x_positions[4], y, status)
+        y -= 14
+
+    # footer total
+    y -= 10
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(40, y, f"Totale giacenza: {round(total_kg,3)} kg")
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return StreamingResponse(buffer, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=inventory.pdf"})
+
+# Inventory expiry notifications (MVP existing + enrich)
 @app.get("/api/inventory/expiring")
 def expiring_inventory(days: int = 7):
     if db is None:
@@ -262,6 +549,8 @@ def expiring_inventory(days: int = 7):
     items = list(db["inventoryitem"].find({"expiry_date": {"$lte": cutoff}}))
     for it in items:
         it["id"] = str(it.pop("_id", ""))
+        # also create a notification per item
+        _notify_expiring(it, days_threshold=days)
     return items
 
 # Tutorials (static seed)
