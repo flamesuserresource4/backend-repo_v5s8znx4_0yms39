@@ -1,48 +1,107 @@
 """
-Database Schemas
+Database Schemas for Gelato Pro Suite
 
-Define your MongoDB collection schemas here using Pydantic models.
-These schemas are used for data validation in your application.
-
-Each Pydantic model represents a collection in your database.
-Model name is converted to lowercase for the collection name:
-- User -> "user" collection
-- Product -> "product" collection
-- BlogPost -> "blogs" collection
+Each Pydantic model represents a collection in MongoDB. The collection name is the
+lowercase of the class name (e.g., Recipe -> "recipe").
 """
 
+from typing import List, Optional
 from pydantic import BaseModel, Field
-from typing import Optional
+from datetime import datetime
 
-# Example schemas (replace with your own):
-
+# Core users (basic for multi-user access; authentication can be added later)
 class User(BaseModel):
-    """
-    Users collection schema
-    Collection name: "user" (lowercase of class name)
-    """
     name: str = Field(..., description="Full name")
     email: str = Field(..., description="Email address")
-    address: str = Field(..., description="Address")
-    age: Optional[int] = Field(None, ge=0, le=120, description="Age in years")
-    is_active: bool = Field(True, description="Whether user is active")
+    role: str = Field("user", description="Role: admin, manager, user")
+    is_active: bool = Field(True)
 
-class Product(BaseModel):
-    """
-    Products collection schema
-    Collection name: "product" (lowercase of class name)
-    """
-    title: str = Field(..., description="Product title")
-    description: Optional[str] = Field(None, description="Product description")
-    price: float = Field(..., ge=0, description="Price in dollars")
-    category: str = Field(..., description="Product category")
-    in_stock: bool = Field(True, description="Whether product is in stock")
+# Ingredients with techno-functional properties
+class Ingredient(BaseModel):
+    name: str
+    category: str = Field(..., description="e.g., milk, cream, sugar, stabilizer, flavor")
+    supplier: Optional[str] = None
+    allergens: List[str] = Field(default_factory=list, description="e.g., ['milk', 'nuts']")
+    cost_per_kg: float = Field(0.0, ge=0, description="Cost in currency per kg")
+    # Technological composition (percentage on 100 g)
+    total_solids_pct: float = Field(0.0, ge=0, le=100)
+    fat_pct: float = Field(0.0, ge=0, le=100)
+    sugar_pct: float = Field(0.0, ge=0, le=100)
+    lactose_pct: float = Field(0.0, ge=0, le=100)
+    stabilizer_pct: float = Field(0.0, ge=0, le=100)
+    sweetness_equiv: float = Field(1.0, ge=0, description="Relative sweetness vs sucrose = 1.0")
+    # Nutrition (per 100 g)
+    energy_kcal: float = Field(0.0, ge=0)
+    protein_g: float = Field(0.0, ge=0)
+    carbs_g: float = Field(0.0, ge=0)
+    sugars_g: float = Field(0.0, ge=0)
+    fat_g: float = Field(0.0, ge=0)
+    sat_fat_g: float = Field(0.0, ge=0)
+    fiber_g: float = Field(0.0, ge=0)
+    salt_g: float = Field(0.0, ge=0)
 
-# Add your own schemas here:
-# --------------------------------------------------
+class RecipeComponent(BaseModel):
+    ingredient_id: str
+    grams: float = Field(..., ge=0)
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+class Recipe(BaseModel):
+    name: str
+    components: List[RecipeComponent] = Field(default_factory=list)
+    yield_kg: Optional[float] = Field(None, ge=0, description="Target batch weight in kg")
+    notes: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    author_id: Optional[str] = None
+
+class BatchLot(BaseModel):
+    recipe_id: str
+    lot_code: str
+    date_produced: datetime
+    expiry_date: datetime
+    quantity_kg: float = Field(..., ge=0)
+
+class InventoryItem(BaseModel):
+    ingredient_id: str
+    lot_code: Optional[str] = None
+    qty_kg: float = Field(..., ge=0)
+    expiry_date: Optional[datetime] = None
+    cost_per_kg: Optional[float] = Field(None, ge=0)
+    supplier: Optional[str] = None
+    last_updated: Optional[datetime] = None
+
+class Customer(BaseModel):
+    business_name: str
+    contact_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    vat_number: Optional[str] = None
+    address: Optional[str] = None
+    notes: Optional[str] = None
+
+class OrderItem(BaseModel):
+    recipe_id: str
+    qty_kg: float = Field(..., ge=0)
+    unit_price: float = Field(0.0, ge=0)
+
+class Order(BaseModel):
+    customer_id: str
+    status: str = Field("draft", description="draft, confirmed, in_production, completed, cancelled")
+    due_date: Optional[datetime] = None
+    items: List[OrderItem] = Field(default_factory=list)
+    total: Optional[float] = Field(None, ge=0)
+
+class Notification(BaseModel):
+    type: str = Field(..., description="e.g., expiry, order, system")
+    message: str
+    date: datetime
+    read: bool = False
+
+class Tutorial(BaseModel):
+    title: str
+    url: str
+    category: Optional[str] = None
+
+# Minimal analytics/report filters
+class ReportFilter(BaseModel):
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    group_by: Optional[str] = Field(None, description="e.g., day, week, month")
